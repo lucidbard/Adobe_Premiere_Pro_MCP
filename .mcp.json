@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "premiere-pro": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "cwd": "C:\\Users\\john\\Adobe_Premiere_Pro_MCP"
+    }
+  }
+}
