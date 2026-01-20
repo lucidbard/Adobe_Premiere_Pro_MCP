@@ -1,16 +1,31 @@
 /**
  * Bridge module for communicating with Adobe Premiere Pro
- * 
+ *
  * This module handles the communication between the MCP server and Adobe Premiere Pro
  * using various methods including UXP, ExtendScript, and file-based communication.
  */
 
 import { Logger } from '../utils/logger.js';
+import {
+  BridgeNotInitializedError,
+  BridgeInitializationError,
+  PremiereNotFoundError,
+  ScriptExecutionError,
+  ResponseTimeoutError,
+  ResponseParseError,
+  PremiereErrorCode,
+  getErrorMessage,
+} from '../utils/errors.js';
 import { ChildProcess } from 'child_process';
 import { promises as fs } from 'fs';
 import { join } from 'path';
-// import { tmpdir } from 'os';
 import { v4 as uuidv4 } from 'uuid';
+
+/** Default timeout for script execution responses in milliseconds */
+const DEFAULT_RESPONSE_TIMEOUT_MS = 30000;
+
+/** Polling interval when waiting for response files in milliseconds */
+const RESPONSE_POLL_INTERVAL_MS = 100;
 
 export interface PremiereProProject {
   id: string;
@@ -84,8 +99,12 @@ export class PremiereProBridge {
       this.isInitialized = true;
       this.logger.info('Adobe Premiere Pro bridge initialized successfully');
     } catch (error) {
+      const message = getErrorMessage(error);
       this.logger.error('Failed to initialize Adobe Premiere Pro bridge:', error);
-      throw error;
+      if (error instanceof BridgeInitializationError || error instanceof PremiereNotFoundError) {
+        throw error;
+      }
+      throw new BridgeInitializationError(message, error instanceof Error ? error : undefined);
     }
   }
 
@@ -94,31 +113,40 @@ export class PremiereProBridge {
       await fs.mkdir(this.tempDir, { recursive: true });
       this.logger.debug(`Temp directory created: ${this.tempDir}`);
     } catch (error) {
+      const message = getErrorMessage(error);
       this.logger.error('Failed to create temp directory:', error);
-      throw error;
+      throw new BridgeInitializationError(`Failed to create temp directory: ${message}`, error instanceof Error ? error : undefined);
     }
   }
 
   private async detectPremiereProInstallation(): Promise<void> {
     // Check for common Premiere Pro installation paths
     const commonPaths = [
+      '/Applications/Adobe Premiere Pro 2025/Adobe Premiere Pro 2025.app',
       '/Applications/Adobe Premiere Pro 2024/Adobe Premiere Pro 2024.app',
       '/Applications/Adobe Premiere Pro 2023/Adobe Premiere Pro 2023.app',
+      'C:\\Program Files\\Adobe\\Adobe Premiere Pro 2025\\Adobe Premiere Pro.exe',
       'C:\\Program Files\\Adobe\\Adobe Premiere Pro 2024\\Adobe Premiere Pro.exe',
       'C:\\Program Files\\Adobe\\Adobe Premiere Pro 2023\\Adobe Premiere Pro.exe'
     ];
 
+    const checkedPaths: string[] = [];
     for (const path of commonPaths) {
       try {
         await fs.access(path);
         this.logger.info(`Found Adobe Premiere Pro at: ${path}`);
         return;
       } catch (error) {
-        // Continue checking other paths
+        // Log at debug level and continue checking other paths
+        this.logger.debug(`Premiere Pro not found at: ${path}`);
+        checkedPaths.push(path);
       }
     }
 
-    this.logger.warn('Adobe Premiere Pro installation not found in common paths');
+    // Log warning with all checked paths for debugging
+    this.logger.warn(`Adobe Premiere Pro installation not found. Checked paths: ${checkedPaths.join(', ')}`);
+    // Note: We don't throw here because the bridge can still work with file-based communication
+    // if Premiere Pro is running and the CEP extension is loaded
   }
 
   private async initializeCommunication(): Promise<void> {
@@ -128,9 +156,9 @@ export class PremiereProBridge {
     this.logger.info(`Using ${this.communicationMethod} communication method`);
   }
 
-  async executeScript(script: string): Promise<any> {
+  async executeScript(script: string, timeoutMs: number = DEFAULT_RESPONSE_TIMEOUT_MS): Promise<any> {
     if (!this.isInitialized) {
-      throw new Error('Bridge not initialized. Call initialize() first.');
+      throw new BridgeNotInitializedError('executeScript');
     }
 
     const commandId = uuidv4();
@@ -146,33 +174,97 @@ export class PremiereProBridge {
       }));
 
       // Wait for response (in a real implementation, this would be handled by the UXP plugin)
-      const response = await this.waitForResponse(responseFile);
-      
-      // Clean up files
-      await fs.unlink(commandFile).catch(() => {});
-      await fs.unlink(responseFile).catch(() => {});
+      const response = await this.waitForResponse(responseFile, timeoutMs, commandId);
+
+      // Clean up files with error logging
+      await this.cleanupCommandFiles(commandFile, responseFile, commandId);
 
       return response;
     } catch (error) {
-      this.logger.error(`Failed to execute script: ${error}`);
-      throw error;
+      // Attempt cleanup even on error
+      await this.cleanupCommandFiles(commandFile, responseFile, commandId);
+
+      if (error instanceof ResponseTimeoutError || error instanceof ResponseParseError) {
+        throw error;
+      }
+
+      const message = getErrorMessage(error);
+      this.logger.error(`Failed to execute script (command ${commandId}): ${message}`);
+      throw new ScriptExecutionError(
+        `Failed to execute script: ${message}`,
+        { commandId },
+        error instanceof Error ? error : undefined
+      );
     }
   }
 
-  private async waitForResponse(responseFile: string, timeout = 30000): Promise<any> {
-    const startTime = Date.now();
-    
-    while (Date.now() - startTime < timeout) {
-      try {
-        const response = await fs.readFile(responseFile, 'utf8');
-        return JSON.parse(response);
-      } catch (error) {
-        // File doesn't exist yet, wait a bit
-        await new Promise(resolve => setTimeout(resolve, 100));
+  /**
+   * Clean up command and response files after script execution
+   */
+  private async cleanupCommandFiles(commandFile: string, responseFile: string, commandId: string): Promise<void> {
+    const cleanupErrors: string[] = [];
+
+    try {
+      await fs.unlink(commandFile);
+    } catch (error) {
+      // Only log if file exists but couldn't be deleted (ENOENT is expected if already cleaned)
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        cleanupErrors.push(`command file: ${getErrorMessage(error)}`);
       }
     }
-    
-    throw new Error('Response timeout');
+
+    try {
+      await fs.unlink(responseFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        cleanupErrors.push(`response file: ${getErrorMessage(error)}`);
+      }
+    }
+
+    if (cleanupErrors.length > 0) {
+      this.logger.warn(`Failed to clean up files for command ${commandId}: ${cleanupErrors.join(', ')}`);
+    }
+  }
+
+  private async waitForResponse(responseFile: string, timeout: number = DEFAULT_RESPONSE_TIMEOUT_MS, commandId?: string): Promise<any> {
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeout) {
+      try {
+        const responseContent = await fs.readFile(responseFile, 'utf8');
+
+        // Separate JSON parse to distinguish parse errors from file read errors
+        try {
+          return JSON.parse(responseContent);
+        } catch (parseError) {
+          // File exists but contains invalid JSON - this is a real error
+          throw new ResponseParseError(
+            `Invalid JSON in response file${commandId ? ` for command ${commandId}` : ''}: ${getErrorMessage(parseError)}`,
+            parseError instanceof Error ? parseError : undefined
+          );
+        }
+      } catch (error) {
+        // Re-throw parse errors immediately
+        if (error instanceof ResponseParseError) {
+          throw error;
+        }
+
+        // For file not found (ENOENT), wait and retry
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          await new Promise(resolve => setTimeout(resolve, RESPONSE_POLL_INTERVAL_MS));
+          continue;
+        }
+
+        // For other file system errors, throw immediately
+        throw new ScriptExecutionError(
+          `Failed to read response file: ${getErrorMessage(error)}`,
+          { commandId, responseFile },
+          error instanceof Error ? error : undefined
+        );
+      }
+    }
+
+    throw new ResponseTimeoutError(timeout, commandId ? `command ${commandId}` : undefined);
   }
 
   // Project Management

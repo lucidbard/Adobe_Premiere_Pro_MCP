@@ -33,7 +33,11 @@ import { PremiereProResources } from './resources/index.js';
 import { PremiereProPrompts } from './prompts/index.js';
 import { PremiereProBridge } from './bridge/index.js';
 import { Logger } from './utils/logger.js';
+import { PremiereError, getErrorMessage } from './utils/errors.js';
 import { zodToJsonSchema } from 'zod-to-json-schema';
+
+/** Timeout for graceful shutdown in milliseconds */
+const SHUTDOWN_TIMEOUT_MS = 5000;
 
 class MCPPremiereProServer {
   private server: Server;
@@ -83,7 +87,7 @@ class MCPPremiereProServer {
     // Execute tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
-      
+
       try {
         const result = await this.tools.executeTool(name, args || {});
         return {
@@ -95,9 +99,14 @@ class MCPPremiereProServer {
           ]
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        this.logger.error(`Tool execution failed: ${errorMessage}`);
-        
+        const errorMessage = getErrorMessage(error);
+        const errorCode = error instanceof PremiereError ? error.code : 'UNKNOWN';
+
+        this.logger.error(`Tool execution failed [${errorCode}]: ${errorMessage}`, {
+          tool: name,
+          error: error instanceof PremiereError ? error.toDetailedString() : errorMessage
+        });
+
         throw new McpError(
           ErrorCode.InternalError,
           `Failed to execute tool '${name}': ${errorMessage}`
@@ -115,7 +124,7 @@ class MCPPremiereProServer {
     // Read resource content
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       const { uri } = request.params;
-      
+
       try {
         const content = await this.resources.readResource(uri);
         return {
@@ -128,9 +137,9 @@ class MCPPremiereProServer {
           ]
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        this.logger.error(`Resource read failed: ${errorMessage}`);
-        
+        const errorMessage = getErrorMessage(error);
+        this.logger.error(`Resource read failed for '${uri}': ${errorMessage}`);
+
         throw new McpError(
           ErrorCode.InternalError,
           `Failed to read resource '${uri}': ${errorMessage}`
@@ -148,7 +157,7 @@ class MCPPremiereProServer {
     // Get prompt content
     this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
-      
+
       try {
         const prompt = await this.prompts.getPrompt(name, args || {});
         return {
@@ -156,9 +165,9 @@ class MCPPremiereProServer {
           messages: prompt.messages
         };
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        this.logger.error(`Prompt generation failed: ${errorMessage}`);
-        
+        const errorMessage = getErrorMessage(error);
+        this.logger.error(`Prompt generation failed for '${name}': ${errorMessage}`);
+
         throw new McpError(
           ErrorCode.InternalError,
           `Failed to generate prompt '${name}': ${errorMessage}`
@@ -201,21 +210,58 @@ class MCPPremiereProServer {
 // Start the server
 const server = new MCPPremiereProServer();
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-  console.error('\nShutting down MCP Adobe Premiere Pro Server...');
-  await server.stop();
-  process.exit(0);
+/**
+ * Graceful shutdown handler with timeout protection
+ */
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.error(`\nReceived ${signal}. Shutting down MCP Adobe Premiere Pro Server...`);
+
+  // Create a timeout promise to prevent hanging
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(`Shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms`));
+    }, SHUTDOWN_TIMEOUT_MS);
+  });
+
+  try {
+    // Race between shutdown and timeout
+    await Promise.race([
+      server.stop(),
+      timeoutPromise
+    ]);
+    console.error('Server shutdown completed successfully');
+    process.exit(0);
+  } catch (error) {
+    const message = getErrorMessage(error);
+    console.error(`Error during shutdown: ${message}`);
+    // Exit with error code but don't hang
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown signals
+process.on('SIGINT', () => {
+  gracefulShutdown('SIGINT').catch(() => process.exit(1));
 });
 
-process.on('SIGTERM', async () => {
-  console.error('\nShutting down MCP Adobe Premiere Pro Server...');
-  await server.stop();
-  process.exit(0);
+process.on('SIGTERM', () => {
+  gracefulShutdown('SIGTERM').catch(() => process.exit(1));
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', getErrorMessage(error));
+  gracefulShutdown('uncaughtException').catch(() => process.exit(1));
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', getErrorMessage(reason));
+  // Don't exit for unhandled rejections, just log
 });
 
 // Start the server
 server.start().catch((error) => {
-  console.error('Failed to start MCP Adobe Premiere Pro Server:', error);
+  console.error('Failed to start MCP Adobe Premiere Pro Server:', getErrorMessage(error));
   process.exit(1);
 }); 

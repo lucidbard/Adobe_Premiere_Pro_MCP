@@ -1,6 +1,6 @@
 /**
  * MCP Tools for Adobe Premiere Pro
- * 
+ *
  * This module provides tools that can be called by AI agents to perform
  * various video editing operations in Adobe Premiere Pro.
  */
@@ -8,6 +8,12 @@
 import { z } from 'zod';
 import { PremiereProBridge } from '../bridge/index.js';
 import { Logger } from '../utils/logger.js';
+import {
+  ToolNotFoundError,
+  InvalidToolArgumentsError,
+  PremiereErrorCode,
+  getErrorMessage,
+} from '../utils/errors.js';
 
 export interface MCPTool {
   name: string;
@@ -400,10 +406,13 @@ export class PremiereProTools {
   async executeTool(name: string, args: Record<string, any>): Promise<any> {
     const tool = this.getAvailableTools().find(t => t.name === name);
     if (!tool) {
+      const availableTools = this.getAvailableTools().map(t => t.name);
+      this.logger.warn(`Tool '${name}' not found. Available: ${availableTools.join(', ')}`);
       return {
         success: false,
         error: `Tool '${name}' not found`,
-        availableTools: this.getAvailableTools().map(t => t.name)
+        code: PremiereErrorCode.TOOL_NOT_FOUND,
+        availableTools
       };
     }
 
@@ -411,14 +420,20 @@ export class PremiereProTools {
     try {
       tool.inputSchema.parse(args);
     } catch (error) {
+      // Extract detailed Zod validation errors
+      let validationDetails = getErrorMessage(error);
+      if (error instanceof z.ZodError) {
+        validationDetails = error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
+      }
+      this.logger.warn(`Invalid arguments for tool '${name}': ${validationDetails}`);
       return {
         success: false,
-        error: `Invalid arguments for tool '${name}': ${error}`,
-        expectedSchema: tool.inputSchema.description
+        error: `Invalid arguments for tool '${name}': ${validationDetails}`,
+        code: PremiereErrorCode.INVALID_TOOL_ARGUMENTS
       };
     }
 
-    this.logger.info(`Executing tool: ${name} with args:`, args);
+    this.logger.info(`Executing tool: ${name}`);
     
     try {
       switch (name) {
@@ -522,16 +537,19 @@ export class PremiereProTools {
           return {
             success: false,
             error: `Tool '${name}' not implemented`,
+            code: PremiereErrorCode.TOOL_NOT_FOUND,
             availableTools: this.getAvailableTools().map(t => t.name)
           };
       }
     } catch (error) {
-      this.logger.error(`Error executing tool ${name}:`, error);
+      const errorMessage = getErrorMessage(error);
+      this.logger.error(`Error executing tool '${name}': ${errorMessage}`);
       return {
         success: false,
-        error: `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`,
-        tool: name,
-        args: args
+        error: `Tool execution failed: ${errorMessage}`,
+        code: PremiereErrorCode.TOOL_EXECUTION_FAILED,
+        tool: name
+        // Note: args intentionally not included to avoid exposing sensitive data in error responses
       };
     }
   }
